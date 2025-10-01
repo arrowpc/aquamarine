@@ -216,6 +216,7 @@ namespace Aquamarine {
         CDRMOutput(const std::string& name_, Hyprutils::Memory::CWeakPointer<CDRMBackend> backend_, Hyprutils::Memory::CSharedPointer<SDRMConnector> connector_);
 
         bool                                                         commitState(bool onlyTest = false);
+        void                                                         syncHDRBrightnessFromBacklight();
 
         Hyprutils::Memory::CWeakPointer<CDRMBackend>                 backend;
         Hyprutils::Memory::CSharedPointer<SDRMConnector>             connector;
@@ -307,6 +308,15 @@ namespace Aquamarine {
         struct {
             bool vrrEnabled = false;
         } atomic;
+
+        struct SBacklightState {
+            std::string path;
+            int64_t     maxBrightness  = 0;
+            int64_t     lastBrightness = -1;
+        };
+
+        std::optional<SBacklightState> backlight;
+        std::string                     connectorPath;
 
         union UDRMConnectorProps {
             struct {

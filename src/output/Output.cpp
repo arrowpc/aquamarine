@@ -1,4 +1,10 @@
 #include <aquamarine/output/Output.hpp>
+#include <algorithm>
+#include <cmath>
+
+#ifndef HDR_METADATA_TYPE_STATIC_METADATA_TYPE1
+#define HDR_METADATA_TYPE_STATIC_METADATA_TYPE1 0
+#endif
 
 using namespace Aquamarine;
 
@@ -134,7 +140,65 @@ void Aquamarine::COutputState::setWideColorGamut(bool wcg) {
 }
 
 void Aquamarine::COutputState::setHDRMetadata(const hdr_output_metadata& metadata) {
-    internalState.hdrMetadata = metadata;
+    internalState.hdrMetadataBase = metadata;
+    internalState.hdrMetadata     = metadata;
+
+    if (metadata.metadata_type == HDR_METADATA_TYPE_STATIC_METADATA_TYPE1 && metadata.hdmi_metadata_type1.eotf)
+        applyHDRBrightness();
+    else
+        internalState.committed |= AQ_OUTPUT_STATE_HDR;
+}
+
+void Aquamarine::COutputState::setHDRBrightnessMultiplier(float multiplier) {
+    if (!std::isfinite(multiplier))
+        return;
+
+    multiplier = std::clamp(multiplier, 0.0f, 1.0f);
+
+    if (std::abs(multiplier - internalState.hdrBrightnessMultiplier) <= 0.001f)
+        return;
+
+    internalState.hdrBrightnessMultiplier = multiplier;
+
+    if (internalState.hdrMetadataBase.has_value())
+        applyHDRBrightness();
+}
+
+void Aquamarine::COutputState::applyHDRBrightness() {
+    if (!internalState.hdrMetadataBase.has_value())
+        return;
+
+    const auto& base = internalState.hdrMetadataBase.value();
+
+    internalState.hdrMetadata = base;
+
+    if (base.metadata_type != HDR_METADATA_TYPE_STATIC_METADATA_TYPE1 || !base.hdmi_metadata_type1.eotf) {
+        internalState.committed |= AQ_OUTPUT_STATE_HDR;
+        return;
+    }
+
+    auto&       adjusted = internalState.hdrMetadata.hdmi_metadata_type1;
+    const auto& baseInfo = base.hdmi_metadata_type1;
+
+    const auto scaleField = [&](uint16_t value) -> uint16_t {
+        if (value == 0)
+            return 0;
+
+        const float scaled = std::clamp(value * internalState.hdrBrightnessMultiplier, 0.0f, 65535.0f);
+        uint16_t    result = static_cast<uint16_t>(std::round(scaled));
+        if (result == 0 && value > 0)
+            result = 1;
+        return result;
+    };
+
+    adjusted.max_display_mastering_luminance = scaleField(baseInfo.max_display_mastering_luminance);
+    adjusted.min_display_mastering_luminance = scaleField(baseInfo.min_display_mastering_luminance);
+    adjusted.max_cll                         = scaleField(baseInfo.max_cll);
+    adjusted.max_fall                        = scaleField(baseInfo.max_fall);
+
+    if (adjusted.max_display_mastering_luminance > 0 && adjusted.min_display_mastering_luminance > adjusted.max_display_mastering_luminance)
+        adjusted.min_display_mastering_luminance = adjusted.max_display_mastering_luminance;
+
     internalState.committed |= AQ_OUTPUT_STATE_HDR;
 }
 

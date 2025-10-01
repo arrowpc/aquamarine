@@ -13,6 +13,8 @@
 #include <deque>
 #include <cstring>
 #include <filesystem>
+#include <optional>
+#include <fstream>
 #include <system_error>
 #include <sys/mman.h>
 #include <fcntl.h>
@@ -218,6 +220,93 @@ static std::vector<SP<CSessionDevice>> scanGPUs(SP<CBackend> backend) {
     }
 
     return vecDevices;
+}
+
+static std::optional<std::string> getDRMStringProperty(int fd, uint32_t object, uint32_t property) {
+    if (!property)
+        return std::nullopt;
+
+    size_t len  = 0;
+    char*  blob = static_cast<char*>(getDRMPropBlob(fd, object, property, &len));
+    if (!blob || len == 0)
+        return std::nullopt;
+
+    std::string value(blob, blob + len);
+    free(blob);
+
+    if (!value.empty() && value.back() == '\0')
+        value.pop_back();
+
+    return value;
+}
+
+static std::optional<int64_t> readIntegerFile(const std::filesystem::path& path) {
+    std::ifstream file(path);
+    if (!file.is_open())
+        return std::nullopt;
+
+    long long value = 0;
+    file >> value;
+    if (file.fail())
+        return std::nullopt;
+
+    return static_cast<int64_t>(value);
+}
+
+static std::optional<SDRMConnector::SBacklightState> detectBacklightForConnector(const SDRMConnector& connector) {
+    namespace fs = std::filesystem;
+
+    const fs::path backlightDir("/sys/class/backlight");
+    std::error_code ec;
+    if (!fs::exists(backlightDir, ec) || !fs::is_directory(backlightDir, ec))
+        return std::nullopt;
+
+    int validDevices = 0;
+    std::optional<SDRMConnector::SBacklightState> fallback;
+
+    for (const auto& entry : fs::directory_iterator(backlightDir, ec)) {
+        if (ec)
+            break;
+
+        const auto brightnessPath = entry.path() / "brightness";
+        const auto maxPath        = entry.path() / "max_brightness";
+
+        auto maxBrightness = readIntegerFile(maxPath);
+        auto brightness    = readIntegerFile(brightnessPath);
+        if (!maxBrightness || !brightness || *maxBrightness <= 0)
+            continue;
+
+        ++validDevices;
+
+        bool matchesConnector = false;
+        if (!connector.connectorPath.empty()) {
+            const auto deviceLink = entry.path() / "device";
+            auto        resolved  = fs::weakly_canonical(deviceLink, ec);
+            if (!ec) {
+                const auto resolvedStr = resolved.string();
+                if (resolvedStr.find(connector.connectorPath) != std::string::npos)
+                    matchesConnector = true;
+            }
+            ec.clear();
+        }
+
+        SDRMConnector::SBacklightState state{
+            .path           = entry.path().string(),
+            .maxBrightness  = *maxBrightness,
+            .lastBrightness = *brightness,
+        };
+
+        if (matchesConnector)
+            return state;
+
+        if (!fallback.has_value() || state.maxBrightness > fallback->maxBrightness)
+            fallback = state;
+    }
+
+    if (validDevices == 1 && fallback.has_value())
+        return fallback;
+
+    return std::nullopt;
 }
 
 SP<CDRMBackend> Aquamarine::CDRMBackend::fromGpu(std::string path, SP<CBackend> backend, SP<CDRMBackend> primary) {
@@ -1205,6 +1294,10 @@ bool Aquamarine::SDRMConnector::init(drmModeConnector* connector) {
     if (props.values.Colorspace)
         getDRMConnectorColorspace(backend->gpu->fd, props.values.Colorspace, &colorspace);
 
+    connectorPath.clear();
+    if (auto path = getDRMStringProperty(backend->gpu->fd, id, props.values.path))
+        connectorPath = *path;
+
     auto name = drmModeGetConnectorTypeName(connector->connector_type);
     if (!name)
         name = "ERROR";
@@ -1473,6 +1566,19 @@ void Aquamarine::SDRMConnector::connect(drmModeConnector* connector) {
 
     backend->backend->log(AQ_LOG_DEBUG, std::format("drm: Description {}", output->description));
 
+    if (connector->connector_type == DRM_MODE_CONNECTOR_eDP || connector->connector_type == DRM_MODE_CONNECTOR_LVDS || connector->connector_type == DRM_MODE_CONNECTOR_DSI) {
+        backlight = detectBacklightForConnector(*this);
+        if (backlight) {
+            backend->backend->log(AQ_LOG_DEBUG, std::format("drm: connector {} using backlight device {}", szName, backlight->path));
+            if (backlight->maxBrightness > 0) {
+                const float multiplier = std::clamp(static_cast<float>(backlight->lastBrightness) / static_cast<float>(backlight->maxBrightness), 0.0f, 1.0f);
+                output->state->setHDRBrightnessMultiplier(multiplier);
+            }
+        } else
+            backend->backend->log(AQ_LOG_DEBUG, std::format("drm: connector {} has no associated backlight device", szName));
+    } else
+        backlight.reset();
+
     status = DRM_MODE_CONNECTED;
 
     recheckCRTCProps();
@@ -1578,7 +1684,47 @@ void Aquamarine::CDRMOutput::setCursorVisible(bool visible) {
     scheduleFrame(AQ_SCHEDULE_CURSOR_VISIBLE);
 }
 
+void Aquamarine::CDRMOutput::syncHDRBrightnessFromBacklight() {
+    if (!connector || !connector->backlight.has_value())
+        return;
+
+    auto& backlight = connector->backlight.value();
+    if (backlight.path.empty())
+        return;
+
+    const std::filesystem::path base(backlight.path);
+
+    auto brightness = readIntegerFile(base / "brightness");
+    if (!brightness)
+        return;
+
+    if (*brightness < 0)
+        return;
+
+    auto maxBrightness = backlight.maxBrightness;
+    if (maxBrightness <= 0) {
+        if (auto max = readIntegerFile(base / "max_brightness")) {
+            if (*max > 0)
+                maxBrightness = backlight.maxBrightness = *max;
+        }
+    }
+
+    if (maxBrightness <= 0)
+        return;
+
+    if (*brightness == backlight.lastBrightness)
+        return;
+
+    backlight.lastBrightness = *brightness;
+
+    const float multiplier = std::clamp(static_cast<float>(*brightness) / static_cast<float>(maxBrightness), 0.0f, 1.0f);
+
+    state->setHDRBrightnessMultiplier(multiplier);
+}
+
 bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
+    syncHDRBrightnessFromBacklight();
+
     if (!backend->backend->session->active) {
         backend->backend->log(AQ_LOG_ERROR, "drm: Session inactive");
         return false;

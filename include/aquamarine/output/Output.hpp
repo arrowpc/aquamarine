@@ -78,6 +78,8 @@ namespace Aquamarine {
             Hyprutils::Math::Mat3x3                        ctm;
             bool                                           wideColorGamut = false;
             hdr_output_metadata                            hdrMetadata;
+            std::optional<hdr_output_metadata>             hdrMetadataBase;
+            float                                          hdrBrightnessMultiplier = 1.0f;
             uint16_t                                       contentType = DRM_MODE_CONTENT_TYPE_GRAPHICS;
         };
 
@@ -100,10 +102,13 @@ namespace Aquamarine {
         void                  setCTM(const Hyprutils::Math::Mat3x3& ctm);
         void                  setWideColorGamut(bool wcg);
         void                  setHDRMetadata(const hdr_output_metadata& metadata);
+        void                  setHDRBrightnessMultiplier(float multiplier);
         void                  setContentType(const uint16_t drmContentType);
 
       private:
         SInternalState internalState;
+
+        void           applyHDRBrightness();
 
         void           onCommit(); // clears a few props like damage and committed.
 
